@@ -1,0 +1,211 @@
+#!/usr/bin/env node
+// call_me — phone Billy with a short spoken update via Bland.ai.
+//
+// Usage:  ./call_me "Your message here"
+//         ./call_me --dry-run "Your message here"   (checks only, no call)
+//
+// Guardrails (all enforced in code, not configurable by flag):
+//   1. Only ever dials ALLOWED_NUMBER. Any other number on the command line is refused.
+//   2. Max DAILY_LIMIT calls per calendar day (Toronto time), counted from calls.log.
+//   3. Messages that look like client data (account numbers, holdings, dollar
+//      amounts, names in call_me.blocklist) are refused before dialing.
+//   4. Every attempt is appended to calls.log with its cost.
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const ALLOWED_NUMBER = '+14165680554';
+const DAILY_LIMIT = 5;
+const TIMEZONE = 'America/Toronto';
+const MAX_MESSAGE_CHARS = 500;
+const API = 'https://api.bland.ai/v1/calls';
+const LOG_FILE = path.join(__dirname, 'calls.log');
+const BLOCKLIST_FILE = path.join(__dirname, 'call_me.blocklist');
+
+function die(msg, code = 1) {
+  console.error(`call_me: ${msg}`);
+  process.exit(code);
+}
+
+function digitsOnly(s) {
+  return s.replace(/\D/g, '');
+}
+
+function today() {
+  // YYYY-MM-DD in Toronto time
+  return new Date().toLocaleDateString('en-CA', { timeZone: TIMEZONE });
+}
+
+function appendLog(entry) {
+  const line = JSON.stringify({ ts: new Date().toISOString(), date: today(), ...entry });
+  fs.appendFileSync(LOG_FILE, line + '\n');
+}
+
+function callsPlacedToday() {
+  if (!fs.existsSync(LOG_FILE)) return 0;
+  const d = today();
+  return fs
+    .readFileSync(LOG_FILE, 'utf8')
+    .split('\n')
+    .filter(Boolean)
+    .map((l) => {
+      try { return JSON.parse(l); } catch { return null; }
+    })
+    // Count anything Bland accepted (it may bill), not refused/failed-to-dispatch attempts.
+    .filter((e) => e && e.date === d && e.call_id).length;
+}
+
+// --- Confidentiality screen -------------------------------------------------
+// A backstop, not a guarantee: the rule is still "never put client data in a call".
+function confidentialityProblems(msg) {
+  const problems = [];
+  const lower = msg.toLowerCase();
+
+  if ((msg.match(/\d[\d\s\-.]*\d/g) || []).some((m) => digitsOnly(m).length >= 5)) {
+    problems.push('contains a long number (possible account/phone number)');
+  }
+  if (/\b(account|acct|a\/c|acc#|account\s*#|rrsp|tfsa|resp|rrif|lira|ira|401k)\b/.test(lower)) {
+    problems.push('mentions an account or account type');
+  }
+  if (/\b(holding|holdings|position|positions|shares|units|allocated to|exposure to)\b/.test(lower)) {
+    problems.push('mentions holdings/positions');
+  }
+  if (/[$€£¥]\s*\d|\d\s*(k|m|mm|bn|b|million|billion|thousand)\b|\b\d+(\.\d+)?\s*(dollars|usd|cad)\b/i.test(msg)) {
+    problems.push('contains a dollar amount');
+  }
+  if (/\$[A-Za-z]{1,5}\b|\b(NYSE|NASDAQ|TSX|TSXV)\s*:/i.test(msg)) {
+    problems.push('contains a ticker symbol');
+  }
+
+  if (fs.existsSync(BLOCKLIST_FILE)) {
+    const names = fs
+      .readFileSync(BLOCKLIST_FILE, 'utf8')
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('#'));
+    for (const name of names) {
+      const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (re.test(msg)) problems.push('contains a name from call_me.blocklist');
+    }
+  }
+  return [...new Set(problems)];
+}
+
+// --- Bland API ---------------------------------------------------------------
+async function bland(method, url, key, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { authorization: key, 'content-type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!res.ok) throw new Error(`Bland ${method} ${res.status}: ${text.slice(0, 300)}`);
+  return data;
+}
+
+async function waitForCompletion(callId, key) {
+  // Poll up to ~6 minutes; the call itself is capped at 2 minutes.
+  for (let i = 0; i < 36; i++) {
+    await new Promise((r) => setTimeout(r, 10_000));
+    try {
+      const d = await bland('GET', `${API}/${callId}`, key);
+      if (d.completed || ['completed', 'failed', 'no-answer', 'busy', 'canceled'].includes(d.status)) {
+        return d;
+      }
+    } catch (e) {
+      // transient; keep polling
+    }
+  }
+  return null;
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const dryRun = args.includes('--dry-run');
+  const rest = args.filter((a) => a !== '--dry-run');
+
+  // Guardrail 1: refuse any attempt to target another number.
+  for (const a of rest) {
+    if (/^--?(to|phone|number|n)\b/i.test(a)) die(`refused: this script only calls ${ALLOWED_NUMBER}; no number option exists.`);
+  }
+  const message = rest.join(' ').trim();
+  if (!message) die('usage: call_me "message to read"');
+
+  const msgDigits = message.match(/\+?\d[\d\s().\-]{8,}\d/g) || [];
+  for (const m of msgDigits) {
+    const d = digitsOnly(m);
+    if (d.length >= 10 && !d.endsWith(digitsOnly(ALLOWED_NUMBER).slice(-10))) {
+      die('refused: message contains a phone number other than the allowed one.');
+    }
+  }
+
+  if (message.length > MAX_MESSAGE_CHARS) die(`refused: message is over ${MAX_MESSAGE_CHARS} characters. Keep updates short.`);
+
+  // Guardrail 3: confidentiality.
+  const problems = confidentialityProblems(message);
+  if (problems.length) {
+    appendLog({ outcome: 'refused_confidentiality', reasons: problems, cost_usd: 0 });
+    die(`refused (no client data on calls): ${problems.join('; ')}.`);
+  }
+
+  // Guardrail 2: daily limit.
+  const used = callsPlacedToday();
+  if (used >= DAILY_LIMIT) {
+    appendLog({ outcome: 'refused_daily_limit', cost_usd: 0 });
+    die(`refused: daily limit of ${DAILY_LIMIT} calls reached (${used} placed today).`);
+  }
+
+  if (dryRun) {
+    console.log(`dry run OK: would call ${ALLOWED_NUMBER} (${used}/${DAILY_LIMIT} used today) and say: "${message}"`);
+    return;
+  }
+
+  const key = process.env.BLAND_API_KEY;
+  if (!key) die('BLAND_API_KEY is not set.');
+
+  const payload = {
+    phone_number: ALLOWED_NUMBER,
+    first_sentence: message,
+    task:
+      'You are an automated status-update caller. You have already said the update in your first sentence. ' +
+      'If asked, repeat the update word for word. Do not add information, answer other questions, or improvise. ' +
+      'After the update (and any repeat), say "Goodbye." and end the call.',
+    wait_for_greeting: true,
+    max_duration: 2,
+    record: false,
+  };
+  // Final belt-and-braces check right before the network call.
+  if (payload.phone_number !== ALLOWED_NUMBER) die('refused: internal number mismatch.');
+
+  let callId;
+  try {
+    const r = await bland('POST', API, key, payload);
+    callId = r.call_id;
+    if (!callId) throw new Error(`no call_id in response: ${JSON.stringify(r).slice(0, 300)}`);
+  } catch (e) {
+    appendLog({ outcome: 'dispatch_failed', error: String(e.message || e), message, cost_usd: 0 });
+    die(`call failed to dispatch: ${e.message || e}`);
+  }
+
+  console.log(`calling ${ALLOWED_NUMBER} (call_id ${callId}) ...`);
+  const final = await waitForCompletion(callId, key);
+  const entry = {
+    outcome: final ? final.status || (final.completed ? 'completed' : 'unknown') : 'pending',
+    call_id: callId,
+    to: ALLOWED_NUMBER,
+    message,
+    minutes: final ? final.call_length ?? null : null,
+    cost_usd: final && final.price != null ? Number(final.price) : null,
+  };
+  appendLog(entry);
+  console.log(
+    `done: ${entry.outcome}, ${entry.minutes ?? '?'} min, cost ${entry.cost_usd != null ? '$' + entry.cost_usd.toFixed(4) : 'unknown (check Bland dashboard)'}` +
+      ` — ${used + 1}/${DAILY_LIMIT} calls today`
+  );
+}
+
+main().catch((e) => die(e.stack || String(e)));
