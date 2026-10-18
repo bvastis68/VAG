@@ -1,2 +1,14 @@
 node_modules/
 .vercel/
+
+# --- Stress report: private data stays on this machine ---
+.env
+.env.*
+!.env.example
+*.ics
+stress_report/data/
+stress_report/output/
+export.zip
+export.xml
+apple_health_export/
+__pycache__/

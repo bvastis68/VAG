@@ -1,0 +1,16 @@
+{
+  "_comment": "First matching rule wins. 'keywords' match the meeting title (case-insensitive). 'domains' match any other attendee's email domain. Edit freely: this file holds rules, not client data.",
+  "rules": [
+    {"type": "Prospect / new business", "keywords": ["intro", "discovery", "prospect", "first meeting", "new client"]},
+    {"type": "Client review", "keywords": ["review", "portfolio", "annual", "quarterly", "qbr", "rebalance", "plan update"]},
+    {"type": "COI / referral partner", "keywords": ["coi", "referral", "lawyer", "accountant", "cpa", "estate counsel"],
+     "domains": ["kpmg.com", "kpmg.ca"]},
+    {"type": "Product / manager due diligence", "keywords": ["blackstone", "blue owl", "neuberger", "due diligence", "wholesaler", "product"]},
+    {"type": "Recruiting / Flywheel", "keywords": ["recruit", "advisor acquisition", "flywheel", "succession"]},
+    {"type": "Compliance / admin", "keywords": ["compliance", "audit", "kyc", "admin"]},
+    {"type": "Team meeting", "keywords": ["team", "huddle", "standup", "stand-up", "pipeline", "weekly sync"]}
+  ],
+  "fallback_internal_1on1": "Internal 1:1",
+  "fallback_internal_group": "Internal group",
+  "fallback_external": "External – other"
+}
